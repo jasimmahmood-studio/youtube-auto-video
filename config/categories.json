@@ -1,0 +1,23 @@
+{
+  "categories": {
+    "geopolitics": {
+      "label": "Geopolitics",
+      "keywords": [
+        "war", "sanctions", "diplomacy", "nato", "elections", "trade war", "conflict",
+        "summit", "treaty", "border", "geopolitics", "coup", "alliance", "missile",
+        "military", "invasion", "ceasefire", "embargo", "nuclear", "territory",
+        "annexation", "rebellion", "protest", "regime", "dictator", "democracy",
+        "united nations", "security council", "foreign policy", "cold war"
+      ],
+      "youtube_category_ids": ["25", "27", "22"]
+    }
+  },
+  "day_rotation": {
+    "0": "geopolitics"
+  },
+  "_help": {
+    "how_to_add_category": "Add a new key under 'categories' with label, keywords array, and youtube_category_ids. Then add it to ENABLED_CATEGORIES in .env.",
+    "how_to_change_rotation": "Edit day_rotation: keys are 0=Monday through 6=Sunday. Use 'all' to pick from any enabled category.",
+    "youtube_category_ids": "22=People&Blogs, 24=Entertainment, 25=News&Politics, 26=Howto&Style, 27=Education, 28=Science&Technology"
+  }
+}

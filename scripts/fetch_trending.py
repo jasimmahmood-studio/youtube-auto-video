@@ -19,47 +19,55 @@ load_dotenv()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
 
-# Keyword banks for niche filtering
-TOPIC_KEYWORDS = {
-    "geopolitics": [
-        "war", "sanctions", "diplomacy", "nato", "elections", "trade war", "conflict",
-        "summit", "treaty", "border", "geopolitics", "coup", "alliance", "missile",
-        "military", "invasion", "ceasefire", "embargo", "nuclear", "territory",
-        "annexation", "rebellion", "protest", "regime", "dictator", "democracy",
-        "united nations", "security council", "foreign policy", "cold war"
-    ],
-    "health": [
-        "health", "disease", "diet", "mental health", "longevity", "fitness", "sleep",
-        "nutrition", "pandemic", "wellness", "medical", "brain", "gut", "immune",
-        "cancer", "diabetes", "anxiety", "depression", "exercise", "weight loss",
-        "fasting", "supplement", "vaccine", "virus", "hormone", "aging", "metabolism",
-        "inflammation", "microbiome", "dopamine", "cortisol"
-    ],
-    "wealth": [
-        "money", "investing", "stocks", "crypto", "real estate", "passive income",
-        "recession", "economy", "finance", "wealth", "debt", "budget", "side hustle",
-        "millionaire", "billionaire", "savings", "retirement", "inflation", "interest rate",
-        "federal reserve", "market crash", "bitcoin", "earnings", "revenue", "profit",
-        "startup", "entrepreneur", "business", "income", "trading"
-    ],
-    "relationship": [
-        "relationship", "dating", "marriage", "divorce", "love", "breakup", "attachment",
-        "communication", "boundaries", "toxic", "partner", "couples", "romance",
-        "cheating", "trust", "intimacy", "loneliness", "self-love", "narcissist",
-        "red flag", "green flag", "situationship", "heartbreak", "compatibility",
-        "emotional intelligence", "vulnerability", "commitment"
-    ]
+# ─── Load categories from config/categories.json ────────────────────
+CONFIG_DIR = Path(__file__).parent.parent / "config"
+CATEGORIES_FILE = CONFIG_DIR / "categories.json"
+
+# Fallback defaults (used if config file missing)
+_DEFAULT_KEYWORDS = {
+    "geopolitics": ["war", "sanctions", "diplomacy", "nato", "elections", "geopolitics", "military", "conflict"],
+    "health": ["health", "disease", "diet", "mental health", "fitness", "wellness", "nutrition"],
+    "wealth": ["money", "investing", "stocks", "crypto", "finance", "economy", "passive income"],
+    "relationship": ["relationship", "dating", "marriage", "love", "breakup", "communication"],
 }
 
-# YouTube category IDs that align with our niches
-RELEVANT_CATEGORY_IDS = [
-    "22",  # People & Blogs
-    "24",  # Entertainment
-    "25",  # News & Politics
-    "26",  # Howto & Style
-    "27",  # Education
-    "28",  # Science & Technology
-]
+
+def _load_categories_config():
+    """Load category definitions from config/categories.json."""
+    if CATEGORIES_FILE.exists():
+        with open(CATEGORIES_FILE) as f:
+            data = json.load(f)
+        return data.get("categories", {}), data.get("day_rotation", {})
+    return {k: {"keywords": v} for k, v in _DEFAULT_KEYWORDS.items()}, {}
+
+
+def _get_enabled_categories():
+    """Get list of enabled categories from ENABLED_CATEGORIES env var."""
+    env_val = os.getenv("ENABLED_CATEGORIES", "").strip()
+    if env_val:
+        return [c.strip().lower() for c in env_val.split(",") if c.strip()]
+    # If not set, return all categories from config
+    cats, _ = _load_categories_config()
+    return list(cats.keys())
+
+
+# Load on import
+_CATEGORIES_CONFIG, _DAY_ROTATION = _load_categories_config()
+ENABLED_CATEGORIES = _get_enabled_categories()
+
+# Build TOPIC_KEYWORDS from config
+TOPIC_KEYWORDS = {}
+for cat_name, cat_data in _CATEGORIES_CONFIG.items():
+    TOPIC_KEYWORDS[cat_name] = cat_data.get("keywords", [])
+
+# Collect all YouTube category IDs from config
+RELEVANT_CATEGORY_IDS = list(set(
+    cid
+    for cat_data in _CATEGORIES_CONFIG.values()
+    for cid in cat_data.get("youtube_category_ids", ["22", "27"])
+))
+
+print(f"Loaded {len(TOPIC_KEYWORDS)} categories, {len(ENABLED_CATEGORIES)} enabled: {', '.join(ENABLED_CATEGORIES)}")
 
 
 def get_trending_videos(region_code="US", max_results=50):
@@ -220,7 +228,8 @@ def find_best_topic(category="all", region_code="US"):
     candidates = []
 
     if category == "all":
-        categories = list(TOPIC_KEYWORDS.keys())
+        # Only search enabled categories
+        categories = [c for c in ENABLED_CATEGORIES if c in TOPIC_KEYWORDS]
     else:
         categories = [category]
 
@@ -275,9 +284,10 @@ def find_best_topic(category="all", region_code="US"):
 
 def main():
     parser = argparse.ArgumentParser(description="Fetch trending YouTube topics by niche")
+    valid_choices = ["all"] + list(TOPIC_KEYWORDS.keys())
     parser.add_argument("--category", default="all",
-                        choices=["all", "geopolitics", "health", "wealth", "relationship"],
-                        help="Topic category to fetch (default: all)")
+                        choices=valid_choices,
+                        help=f"Topic category to fetch (default: all). Available: {', '.join(valid_choices)}")
     parser.add_argument("--region", default="US", help="YouTube region code (default: US)")
     parser.add_argument("--output", default=None, help="Output file path (default: output/trending_topic_DATE.json)")
     args = parser.parse_args()

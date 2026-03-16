@@ -153,8 +153,8 @@ def _build_description(metadata):
 
 {hashtag_line}
 
-Subscribe for daily videos on {category}, and more!
-Hit the bell icon to never miss an update.
+Ambitious Rulers — Daily geopolitics analysis.
+Subscribe and hit the bell to never miss an update!
 
 ---
 

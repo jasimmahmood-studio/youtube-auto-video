@@ -18,17 +18,46 @@ from dotenv import load_dotenv
 load_dotenv()
 
 SCRIPTS_DIR = Path(__file__).parent
+CONFIG_DIR = SCRIPTS_DIR.parent / "config"
+CATEGORIES_FILE = CONFIG_DIR / "categories.json"
 
-# Category rotation: Mon=Geopolitics, Tue=Health, Wed=Wealth, Thu=Relationship, Fri-Sun=any
-DAY_CATEGORY_MAP = {
-    0: "geopolitics",   # Monday
-    1: "health",        # Tuesday
-    2: "wealth",        # Wednesday
-    3: "relationship",  # Thursday
-    4: "all",           # Friday — best of any category
-    5: "all",           # Saturday
-    6: "all",           # Sunday
-}
+
+def _load_config():
+    """Load category config and build day rotation."""
+    if CATEGORIES_FILE.exists():
+        with open(CATEGORIES_FILE) as f:
+            data = json.load(f)
+        categories = data.get("categories", {})
+        day_rotation_raw = data.get("day_rotation", {})
+        # Convert string keys to int
+        day_rotation = {int(k): v for k, v in day_rotation_raw.items()}
+    else:
+        categories = {}
+        day_rotation = {}
+
+    # Filter by ENABLED_CATEGORIES from .env
+    env_enabled = os.getenv("ENABLED_CATEGORIES", "").strip()
+    if env_enabled:
+        enabled = [c.strip().lower() for c in env_enabled.split(",") if c.strip()]
+    else:
+        enabled = list(categories.keys())
+
+    # If no day_rotation in config, auto-build from enabled categories
+    if not day_rotation:
+        day_rotation = {}
+        for i in range(7):
+            if i < len(enabled):
+                day_rotation[i] = enabled[i]
+            else:
+                day_rotation[i] = "all"
+
+    return categories, enabled, day_rotation
+
+
+_CATEGORIES, ENABLED_CATEGORIES, DAY_CATEGORY_MAP = _load_config()
+_DAY_NAMES = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+_rotation_str = ', '.join(f"{_DAY_NAMES[k]}={v}" for k, v in sorted(DAY_CATEGORY_MAP.items()) if k < 7)
+print(f"Category rotation: {_rotation_str}")
 
 
 def get_todays_category(override=None):
@@ -74,7 +103,21 @@ def run_step(name, cmd, dry_run=False):
         return False, str(e)
 
 
-def run_pipeline(category=None, region="US", voice="Matthew", music=None,
+def _clean_output():
+    """Remove previous output files (videos, scripts, topics) before a fresh run."""
+    output_dir = Path("output")
+    if not output_dir.exists():
+        return
+    removed = 0
+    for f in output_dir.iterdir():
+        if f.is_file() and f.suffix in (".mp4", ".json", ".srt", ".txt"):
+            f.unlink()
+            removed += 1
+    if removed:
+        print(f"Cleaned {removed} old output file(s)")
+
+
+def run_pipeline(category=None, region="US", voice="Brian", music=None,
                  privacy="public", dry_run=False, skip_upload=False):
     """Run the full video production pipeline."""
     today = datetime.now().strftime("%Y-%m-%d")
@@ -99,6 +142,10 @@ def run_pipeline(category=None, region="US", voice="Matthew", music=None,
     # Ensure output and logs directories exist
     Path("output").mkdir(exist_ok=True)
     Path("logs").mkdir(exist_ok=True)
+
+    # Clean previous output files
+    if not dry_run:
+        _clean_output()
 
     # Step 1: Fetch trending topic
     topic_file = f"output/trending_topic_{today}.json"
@@ -220,9 +267,10 @@ def setup_cron():
 
 def main():
     parser = argparse.ArgumentParser(description="YouTube Auto Video — Daily Pipeline")
+    valid_cats = ["all"] + list(_CATEGORIES.keys())
     parser.add_argument("--category", default=None,
-                        choices=["all", "geopolitics", "health", "wealth", "relationship"],
-                        help="Override category (default: auto-rotates by day)")
+                        choices=valid_cats,
+                        help=f"Override category (default: auto-rotates by day). Available: {', '.join(valid_cats)}")
     parser.add_argument("--region", default="US", help="YouTube region code (default: US)")
     parser.add_argument("--voice", default="Brian", help="HeyGen voice (default: Brian)")
     parser.add_argument("--music", default=None, help="Background music file path")

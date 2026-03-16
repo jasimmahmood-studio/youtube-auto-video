@@ -278,23 +278,30 @@ def _get_audio_duration(audio_path):
         return 0
 
 
-# ─── Subtitle Generation ────────────────────────────────────────────
+# ─── Subtitle Generation (SRT file approach) ──────────────────────────
 
-def generate_subtitle_filter(word_timestamps, config=None):
+def _seconds_to_srt_time(seconds):
+    """Convert seconds to SRT timestamp format: HH:MM:SS,mmm"""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int((seconds % 1) * 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def generate_srt_file(word_timestamps, output_path, config=None):
     """
-    Generate FFmpeg drawtext filter chain for word-by-word subtitles.
+    Generate an SRT subtitle file from word timestamps.
 
-    The 'eye-comfort' approach: show 4-6 words at a time, highlighting the
-    current word in gold while others stay white. This reduces cognitive load
-    compared to showing one word at a time (too fast) or full sentences (too much to read).
+    Groups words into readable chunks (4-6 words, max 42 chars per line)
+    for comfortable viewing — the 'eye-comfort' approach.
     """
     cfg = config or SUBTITLE_CONFIG
-    filters = []
 
     if not word_timestamps:
-        return ""
+        return None
 
-    # Group words into subtitle chunks (4-6 words each)
+    # Group words into subtitle chunks
     chunks = []
     current_chunk = []
     current_chars = 0
@@ -307,9 +314,8 @@ def generate_subtitle_filter(word_timestamps, config=None):
         current_chunk.append({"word": word, "start": start, "end": end})
         current_chars += len(word) + 1
 
-        # Break chunk at sentence boundaries or character limit
         if (current_chars >= cfg["max_chars_per_line"]
-                or word.endswith((".", "!", "?", ","))
+                or word.rstrip().endswith((".", "!", "?"))
                 or len(current_chunk) >= 6):
             chunks.append(current_chunk)
             current_chunk = []
@@ -318,80 +324,29 @@ def generate_subtitle_filter(word_timestamps, config=None):
     if current_chunk:
         chunks.append(current_chunk)
 
-    # Build FFmpeg drawtext filters for each chunk
-    font_path = str(FONT_PATH) if FONT_PATH.exists() else "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    # Write SRT file
+    with open(output_path, "w", encoding="utf-8") as f:
+        for idx, chunk in enumerate(chunks, 1):
+            start_time = _seconds_to_srt_time(chunk[0]["start"])
+            end_time = _seconds_to_srt_time(chunk[-1]["end"])
+            text = " ".join(w["word"] for w in chunk)
+            f.write(f"{idx}\n{start_time} --> {end_time}\n{text}\n\n")
 
-    for chunk in chunks:
-        chunk_start = chunk[0]["start"]
-        chunk_end = chunk[-1]["end"]
-        full_text = " ".join(w["word"] for w in chunk)
-
-        # Base text (white, all words)
-        filters.append(
-            f"drawtext=text='{_escape_ffmpeg(full_text)}':"
-            f"fontfile='{font_path}':"
-            f"fontsize={cfg['font_size']}:"
-            f"fontcolor={cfg['primary_color']}:"
-            f"borderw={cfg['outline_width']}:"
-            f"bordercolor=black:"
-            f"box=1:boxcolor={cfg['bg_color']}:boxborderw=8:"
-            f"x=(w-text_w)/2:y=h-{cfg['margin_bottom']}-text_h:"
-            f"enable='between(t,{chunk_start},{chunk_end})'"
-        )
-
-        # Highlight current word overlay (gold)
-        # This creates a separate drawtext for each word's active period
-        x_offset = 0
-        for i, wt in enumerate(chunk):
-            word = wt["word"]
-            w_start = wt["start"]
-            w_end = wt["end"]
-
-            # Calculate x position for this word within the chunk
-            # We approximate character width as fontsize * 0.6
-            char_width = cfg["font_size"] * 0.55
-            prefix_len = len(" ".join(w["word"] for w in chunk[:i]))
-            if i > 0:
-                prefix_len += 1  # space before word
-
-            # Highlight just this word in gold
-            filters.append(
-                f"drawtext=text='{_escape_ffmpeg(word)}':"
-                f"fontfile='{font_path}':"
-                f"fontsize={cfg['font_size']}:"
-                f"fontcolor={cfg['highlight_color']}:"
-                f"borderw={cfg['outline_width']}:"
-                f"bordercolor=black:"
-                f"x=(w-text_w)/2-{int(len(full_text)*char_width/2)}+{int(prefix_len*char_width)}:"
-                f"y=h-{cfg['margin_bottom']}-text_h:"
-                f"enable='between(t,{w_start},{w_end})'"
-            )
-
-    return ",".join(filters)
-
-
-def _escape_ffmpeg(text):
-    """Escape special characters for FFmpeg drawtext."""
-    return (text
-            .replace("\\", "\\\\")
-            .replace("'", "\\'")
-            .replace(":", "\\:")
-            .replace("%", "%%")
-            .replace("[", "\\[")
-            .replace("]", "\\]"))
+    return output_path
 
 
 # ─── Video Assembly (FFmpeg) ─────────────────────────────────────────
 
-def assemble_video(clips_dir, audio_path, subtitle_filter, output_path, bg_music_path=None):
+def assemble_video(clips_dir, audio_path, srt_path, output_path, bg_music_path=None):
     """
-    Assemble final video: stock clips + narration audio + subtitles.
+    Assemble final video: stock clips + narration audio + SRT subtitles.
+    Uses the 'subtitles' filter (libass) which works on all platforms.
     """
     # Check FFmpeg availability
     try:
         subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
     except (FileNotFoundError, subprocess.CalledProcessError):
-        print("ERROR: FFmpeg not found. Install it: sudo apt-get install ffmpeg -y")
+        print("ERROR: FFmpeg not found. Install it: brew install ffmpeg")
         sys.exit(1)
 
     # Get audio duration
@@ -402,61 +357,142 @@ def assemble_video(clips_dir, audio_path, subtitle_filter, output_path, bg_music
     )
     audio_duration = float(probe.stdout.strip())
 
-    # List all clip files
-    clip_files = sorted(Path(clips_dir).glob("*.mp4"))
-    if not clip_files:
+    # List all raw clip files
+    raw_clips = sorted(Path(clips_dir).glob("*.mp4"))
+    if not raw_clips:
         print("ERROR: No clip files found in", clips_dir)
         sys.exit(1)
 
-    # Create a concat file for clips
+    # Step 1a: Normalize every clip to identical format (codec, resolution, fps, pixel format)
+    # This is REQUIRED — concat demuxer freezes if clips differ in any of these
+    norm_dir = Path(clips_dir) / "normalized"
+    norm_dir.mkdir(exist_ok=True)
+    norm_clips = []
+
+    print(f"  Normalizing {len(raw_clips)} clips to 1920x1080 @ 30fps...")
+    for i, clip in enumerate(raw_clips):
+        norm_path = norm_dir / f"norm_{i:03d}.mp4"
+        cmd_norm = [
+            "ffmpeg", "-y", "-i", str(clip),
+            "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,fps=30",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-an",
+            str(norm_path)
+        ]
+        result = subprocess.run(cmd_norm, capture_output=True, text=True)
+        if result.returncode == 0 and norm_path.exists():
+            norm_clips.append(norm_path)
+        else:
+            print(f"  WARNING: Failed to normalize {clip.name}: {result.stderr[-200:]}")
+
+    if not norm_clips:
+        print("ERROR: All clip normalizations failed")
+        sys.exit(1)
+
+    # Get actual duration of each normalized clip
+    clip_durations = {}
+    for clip in norm_clips:
+        try:
+            p = subprocess.run(
+                ["ffprobe", "-i", str(clip), "-show_entries", "format=duration",
+                 "-v", "quiet", "-of", "csv=p=0"],
+                capture_output=True, text=True
+            )
+            clip_durations[clip] = float(p.stdout.strip())
+        except (ValueError, Exception):
+            clip_durations[clip] = 5.0
+
+    total_clip_pool = sum(clip_durations.values())
+    print(f"  Stock footage pool: {total_clip_pool:.1f}s across {len(norm_clips)} clips")
+    print(f"  Audio duration: {audio_duration:.1f}s")
+
+    # Step 1b: Build concat list, looping normalized clips until we cover audio + 20% buffer
     concat_file = Path(clips_dir) / "concat.txt"
     total_clip_duration = 0
+    target_duration = audio_duration * 1.2
 
     with open(concat_file, "w") as f:
-        while total_clip_duration < audio_duration:
-            for clip in clip_files:
-                if total_clip_duration >= audio_duration:
+        loop_count = 0
+        while total_clip_duration < target_duration:
+            for clip in norm_clips:
+                if total_clip_duration >= target_duration:
                     break
                 f.write(f"file '{clip.resolve()}'\n")
-                # Estimate clip duration (~10s each)
-                total_clip_duration += 10
+                total_clip_duration += clip_durations.get(clip, 5.0)
+            loop_count += 1
+            if loop_count > 20:
+                break
 
-    # Step 1: Concatenate clips to match audio duration
+    print(f"  Concat plan: {total_clip_duration:.1f}s of footage ({loop_count} loop(s))")
+
+    # Step 1c: Concatenate normalized clips (now safe — all identical format)
     concat_video = Path(clips_dir) / "concat.mp4"
     cmd_concat = [
         "ffmpeg", "-y",
         "-f", "concat", "-safe", "0", "-i", str(concat_file),
         "-t", str(audio_duration),
-        "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:v", "copy",
         "-an",
         str(concat_video)
     ]
-    subprocess.run(cmd_concat, capture_output=True, check=True)
+    result = subprocess.run(cmd_concat, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"ERROR: Concat failed:\n{result.stderr[-500:]}")
+        sys.exit(1)
 
     # Step 2: Merge video + audio + subtitles
+    # Build the subtitle filter string (yellow border + black shadow = 3D look)
+    sub_filter = ""
+    if srt_path and Path(srt_path).exists():
+        escaped_srt = str(srt_path).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+        font_dir = str(FONT_PATH.parent) if FONT_PATH.exists() else ""
+        # ASS colour format: &HAABBGGRR
+        # Yellow #FFD700 → &H0000D7FF  |  Black → &H00000000
+        style_parts = [
+            f"FontName={SUBTITLE_CONFIG['font_family']}",
+            f"FontSize={SUBTITLE_CONFIG['font_size']}",
+            "PrimaryColour=&H00000000",       # black text
+            "OutlineColour=&H0000D7FF",       # yellow border (FFD700 in BGR)
+            f"Outline={SUBTITLE_CONFIG['outline_width']}",
+            "BackColour=&H00000000",          # black shadow
+            "Shadow=2",                       # shadow depth for 3D feel
+            "BorderStyle=1",                  # outline + drop shadow (NOT opaque box)
+            f"MarginV={SUBTITLE_CONFIG['margin_bottom']}",
+            "Alignment=2",                    # bottom center
+            "Bold=1",
+        ]
+        style_str = ",".join(style_parts)
+        if font_dir:
+            sub_filter = f"subtitles={escaped_srt}:fontsdir={font_dir}:force_style='{style_str}'"
+        else:
+            sub_filter = f"subtitles={escaped_srt}:force_style='{style_str}'"
+    else:
+        print("  No subtitles to burn (SRT file missing or empty)")
+
+    # Build final command
     cmd_final = [
         "ffmpeg", "-y",
         "-i", str(concat_video),
         "-i", audio_path,
     ]
 
-    # Add background music if provided
     if bg_music_path and Path(bg_music_path).exists():
         cmd_final.extend(["-i", bg_music_path])
 
-    # Video filter: subtitles
-    vf = subtitle_filter if subtitle_filter else "null"
-    cmd_final.extend(["-vf", vf])
+    # Video filter: burn subtitles via -vf (works with -map)
+    if sub_filter:
+        cmd_final.extend(["-vf", sub_filter])
 
-    # Audio mixing
+    # Audio handling
     if bg_music_path and Path(bg_music_path).exists():
-        # Mix narration (full volume) + music (10% volume)
+        # Mix narration (full volume) + background music (10% volume)
         cmd_final.extend([
             "-filter_complex", "[1:a]volume=1.0[narr];[2:a]volume=0.1[music];[narr][music]amix=inputs=2:duration=first[aout]",
             "-map", "0:v", "-map", "[aout]",
         ])
     else:
+        # Simple: video from input 0, audio from input 1
         cmd_final.extend(["-map", "0:v", "-map", "1:a"])
 
     cmd_final.extend([
@@ -467,9 +503,10 @@ def assemble_video(clips_dir, audio_path, subtitle_filter, output_path, bg_music
         str(output_path)
     ])
 
+    print(f"  FFmpeg command: {' '.join(str(x) for x in cmd_final[:6])}...")
     result = subprocess.run(cmd_final, capture_output=True, text=True)
     if result.returncode != 0:
-        print(f"ERROR: FFmpeg final assembly failed:\n{result.stderr}")
+        print(f"ERROR: FFmpeg final assembly failed:\n{result.stderr[-500:]}")
         sys.exit(1)
 
     # Cleanup temp concat video
@@ -482,7 +519,7 @@ def assemble_video(clips_dir, audio_path, subtitle_filter, output_path, bg_music
 
 # ─── Main Pipeline ───────────────────────────────────────────────────
 
-def create_video(script_path, voice_id="Matthew", bg_music=None, output=None):
+def create_video(script_path, voice_id="Brian", bg_music=None, output=None):
     """Full video creation pipeline."""
     # Load script
     with open(script_path) as f:
@@ -501,7 +538,7 @@ def create_video(script_path, voice_id="Matthew", bg_music=None, output=None):
 
         # Step 1: Fetch stock footage
         print("\n[1/4] Fetching stock footage from Pexels...")
-        clips = fetch_stock_clips(footage_queries, count_per_query=2)
+        clips = fetch_stock_clips(footage_queries, count_per_query=3)
         for i, clip in enumerate(clips):
             clip_path = clips_dir / f"clip_{i:03d}.mp4"
             print(f"  Downloading: {clip['query']} ({clip['duration']}s)")
@@ -513,14 +550,16 @@ def create_video(script_path, voice_id="Matthew", bg_music=None, output=None):
         narration = generate_narration(script_text, voice_id=voice_id, output_path=audio_path)
         print(f"  Narration: {narration['duration']:.1f}s")
 
-        # Step 3: Generate subtitle filter
-        print("\n[3/4] Building eye-comfort subtitles...")
+        # Step 3: Generate SRT subtitle file
+        print("\n[3/4] Building eye-comfort subtitles (SRT)...")
         word_timestamps = narration.get("word_timestamps", [])
-        subtitle_filter = generate_subtitle_filter(word_timestamps)
-        if subtitle_filter:
-            print(f"  Subtitles: {len(word_timestamps)} words with word-by-word highlight")
+        srt_path = str(tmpdir / "subtitles.srt")
+        srt_result = generate_srt_file(word_timestamps, srt_path)
+        if srt_result:
+            print(f"  Subtitles: {len(word_timestamps)} words → SRT file ready")
         else:
             print("  WARNING: No word timestamps available, subtitles will be skipped")
+            srt_path = None
 
         # Step 4: Assemble video
         print("\n[4/4] Assembling final video...")
@@ -531,7 +570,7 @@ def create_video(script_path, voice_id="Matthew", bg_music=None, output=None):
         assemble_video(
             clips_dir=str(clips_dir),
             audio_path=str(audio_path),
-            subtitle_filter=subtitle_filter,
+            srt_path=srt_path,
             output_path=output_path,
             bg_music_path=bg_music,
         )
@@ -543,7 +582,7 @@ def create_video(script_path, voice_id="Matthew", bg_music=None, output=None):
 def main():
     parser = argparse.ArgumentParser(description="Create a video from a script")
     parser.add_argument("--script", required=True, help="Path to script JSON file")
-    parser.add_argument("--voice", default="Matthew", help="HeyGen voice ID (default: Matthew)")
+    parser.add_argument("--voice", default="Brian", help="HeyGen voice name (default: Brian)")
     parser.add_argument("--music", default=None, help="Path to background music file")
     parser.add_argument("--output", default=None, help="Output video file path")
     args = parser.parse_args()
