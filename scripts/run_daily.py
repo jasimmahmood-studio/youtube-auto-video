@@ -118,7 +118,7 @@ def run_pipeline(category=None, region="US", voice="Matthew", music=None,
     success, output = run_step(
         "Generate Script",
         [sys.executable, str(SCRIPTS_DIR / "generate_script.py"),
-         "--topic", topic_file, "--output", script_file],
+         "--topic", topic_file, "--ai", "claude", "--output", script_file],
         dry_run=dry_run
     )
     log["steps"]["generate_script"] = {"success": success, "output": script_file}
@@ -224,7 +224,7 @@ def main():
                         choices=["all", "geopolitics", "health", "wealth", "relationship"],
                         help="Override category (default: auto-rotates by day)")
     parser.add_argument("--region", default="US", help="YouTube region code (default: US)")
-    parser.add_argument("--voice", default="Matthew", help="HeyGen voice (default: Matthew)")
+    parser.add_argument("--voice", default="Brian", help="HeyGen voice (default: Brian)")
     parser.add_argument("--music", default=None, help="Background music file path")
     parser.add_argument("--privacy", default="public",
                         choices=["public", "private", "unlisted"],

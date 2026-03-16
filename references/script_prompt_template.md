@@ -53,12 +53,12 @@ Also generate:
 3. **Tags**: 15-20 tags, mix of broad ("health tips") and specific ("intermittent fasting 2026")
 4. **Stock footage queries**: 5-8 search terms to find relevant B-roll on Pexels (be specific: "doctor examining patient" not just "health")
 
-Return as JSON with keys: title, description, tags, script_text, sections (array of {type, text, duration_estimate}), stock_footage_queries
+Return as JSON with keys: title, description, tags, script_text, sections (array of objects with keys: type, text, duration_estimate), stock_footage_queries
 ```
 
 ## Customization Notes
 
 - To make videos longer, change "60-90 seconds" to your target and adjust body section
 - To change tone, modify the system prompt (e.g., "casual and humorous" or "serious and analytical")
-- The `{category}` variable affects tone slightly — geopolitics gets a more serious treatment than health tips
+- The "category" variable affects tone slightly — geopolitics gets a more serious treatment than health tips
 - Stock footage queries should be specific enough for Pexels to return relevant results

@@ -112,61 +112,170 @@ def download_clip(url, output_path):
     return output_path
 
 
-# ─── Narration (HeyGen) ─────────────────────────────────────────────
+# ─── Narration (HeyGen TTS) ──────────────────────────────────────────
 
-def generate_narration(script_text, voice_id="Matthew"):
-    """Generate narration audio using HeyGen's text-to-speech API."""
+# Map friendly voice names to actual HeyGen voice IDs
+HEYGEN_VOICE_MAP = {
+    "Brian": "f38a635bee7a4d1f9b0a654a31d050d2",        # Chill Brian (male)
+    "Allison": "f8c69e517f424cafaecde32dde57096b",       # Allison (female)
+    "Ivy": "cef3bc4e0a84424cafcde6f2cf466c97",           # Ivy (female)
+    "John": "d92994ae0de34b2e8659b456a2f388b8",          # John Doe (male)
+    "Mark": "5d8c378ba8c3434586081a52ac368738",           # Mark (male)
+    "Monika": "97dd67ab8ce242b6a9e7689cb00c6414",        # Monika Sogam (female)
+    "Hope": "42d00d4aac5441279d8536cd6b52c53c",          # Hope (female)
+    # Fallback defaults
+    "Matthew": "d92994ae0de34b2e8659b456a2f388b8",       # Maps to John Doe
+    "Sara": "cef3bc4e0a84424cafcde6f2cf466c97",          # Maps to Ivy
+    "Josh": "f38a635bee7a4d1f9b0a654a31d050d2",          # Maps to Chill Brian
+}
+
+
+def generate_narration(script_text, voice_id="Brian", output_path="narration.mp3"):
+    """
+    Generate narration audio using HeyGen's text-to-speech API.
+    Endpoint: POST /v1/audio/text_to_speech
+    Returns audio file with word-level timestamps for subtitle sync.
+    """
     if not HEYGEN_API_KEY:
         print("ERROR: HEYGEN_API_KEY not set in .env")
         sys.exit(1)
+
+    # Resolve friendly name to actual HeyGen voice ID
+    resolved_id = HEYGEN_VOICE_MAP.get(voice_id, voice_id)
+    print(f"  Voice: {voice_id} ({resolved_id[:12]}...)")
 
     headers = {
         "X-Api-Key": HEYGEN_API_KEY,
         "Content-Type": "application/json",
     }
 
-    # Create TTS audio via HeyGen
     payload = {
         "text": script_text,
-        "voice_id": voice_id,
-        "speed": 1.0,
-        "pitch": 0,
+        "voice_id": resolved_id,
     }
 
-    # HeyGen v2 audio generation endpoint
     resp = requests.post(
-        f"{HEYGEN_API_BASE}/v2/voice/generate",
+        f"{HEYGEN_API_BASE}/v1/audio/text_to_speech",
         headers=headers,
         json=payload,
     )
 
     if resp.status_code != 200:
-        print(f"ERROR: HeyGen TTS failed: {resp.status_code} - {resp.text}")
+        print(f"ERROR: HeyGen TTS failed: {resp.status_code} - {resp.text[:300]}")
         sys.exit(1)
 
     result = resp.json()
-    audio_url = result.get("data", {}).get("url")
-    word_timestamps = result.get("data", {}).get("word_timestamps", [])
+    data = result.get("data", {})
+    audio_url = data.get("url") or data.get("audio_url")
+    word_timestamps_raw = data.get("word_timestamps", [])
 
     if not audio_url:
-        print("ERROR: No audio URL returned from HeyGen")
+        # Some HeyGen responses nest differently
+        audio_url = result.get("url") or result.get("audio_url")
+
+    if not audio_url:
+        print(f"ERROR: No audio URL in HeyGen response. Full response: {json.dumps(result)[:500]}")
         sys.exit(1)
 
+    # Download the audio file
+    audio_resp = requests.get(audio_url, stream=True)
+    audio_resp.raise_for_status()
+    with open(output_path, "wb") as f:
+        for chunk in audio_resp.iter_content(chunk_size=8192):
+            f.write(chunk)
+
+    # Parse word timestamps into our format
+    word_timestamps = []
+    for wt in word_timestamps_raw:
+        word_timestamps.append({
+            "word": wt.get("word", wt.get("text", "")),
+            "start": wt.get("start", wt.get("start_time", 0)),
+            "end": wt.get("end", wt.get("end_time", 0)),
+        })
+
+    # If no word timestamps from API, estimate them from text
+    if not word_timestamps:
+        duration = _get_audio_duration(output_path)
+        word_timestamps = _estimate_word_timestamps(script_text, duration)
+
+    duration = data.get("duration") or _get_audio_duration(output_path)
+
+    print(f"  Audio downloaded: {output_path}")
     return {
-        "audio_url": audio_url,
-        "duration": result.get("data", {}).get("duration", 0),
+        "audio_path": output_path,
+        "duration": duration,
         "word_timestamps": word_timestamps,
     }
 
 
-def download_audio(audio_url, output_path):
-    """Download narration audio."""
-    resp = requests.get(audio_url, stream=True)
-    resp.raise_for_status()
-    with open(output_path, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=8192):
-            f.write(chunk)
-    return output_path
+def _estimate_word_timestamps(text, total_duration):
+    """Estimate word timestamps when API doesn't provide them."""
+    words = text.split()
+    if not words or total_duration <= 0:
+        return []
+
+    time_per_word = total_duration / len(words)
+    timestamps = []
+    for i, word in enumerate(words):
+        timestamps.append({
+            "word": word,
+            "start": round(i * time_per_word, 3),
+            "end": round((i + 1) * time_per_word, 3),
+        })
+    return timestamps
+
+
+def _parse_vtt_timestamps(vtt_path):
+    """Parse word-level timestamps from SRT/VTT output."""
+    timestamps = []
+    if not Path(vtt_path).exists():
+        return timestamps
+
+    with open(vtt_path) as f:
+        lines = f.readlines()
+
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        # Look for timestamp lines like: 00:00:00.000 --> 00:00:01.500
+        if "-->" in line:
+            parts = line.split("-->")
+            start = _vtt_time_to_seconds(parts[0].strip())
+            end = _vtt_time_to_seconds(parts[1].strip())
+            # Next line is the text
+            i += 1
+            if i < len(lines):
+                word = lines[i].strip()
+                if word:
+                    timestamps.append({"word": word, "start": start, "end": end})
+        i += 1
+
+    return timestamps
+
+
+def _vtt_time_to_seconds(time_str):
+    """Convert VTT timestamp (HH:MM:SS.mmm) to seconds."""
+    parts = time_str.replace(",", ".").split(":")
+    if len(parts) == 3:
+        h, m, s = parts
+        return float(h) * 3600 + float(m) * 60 + float(s)
+    elif len(parts) == 2:
+        m, s = parts
+        return float(m) * 60 + float(s)
+    return float(parts[0])
+
+
+def _get_audio_duration(audio_path):
+    """Get audio duration in seconds via ffprobe."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-i", audio_path, "-show_entries", "format=duration",
+             "-v", "quiet", "-of", "csv=p=0"],
+            capture_output=True, text=True
+        )
+        return float(result.stdout.strip())
+    except Exception:
+        return 0
 
 
 # ─── Subtitle Generation ────────────────────────────────────────────
@@ -399,10 +508,9 @@ def create_video(script_path, voice_id="Matthew", bg_music=None, output=None):
             download_clip(clip["url"], str(clip_path))
 
         # Step 2: Generate narration
-        print("\n[2/4] Generating narration via HeyGen...")
-        narration = generate_narration(script_text, voice_id=voice_id)
-        audio_path = tmpdir / "narration.mp3"
-        download_audio(narration["audio_url"], str(audio_path))
+        print("\n[2/4] Generating narration via HeyGen TTS...")
+        audio_path = str(tmpdir / "narration.mp3")
+        narration = generate_narration(script_text, voice_id=voice_id, output_path=audio_path)
         print(f"  Narration: {narration['duration']:.1f}s")
 
         # Step 3: Generate subtitle filter
@@ -412,7 +520,7 @@ def create_video(script_path, voice_id="Matthew", bg_music=None, output=None):
         if subtitle_filter:
             print(f"  Subtitles: {len(word_timestamps)} words with word-by-word highlight")
         else:
-            print("  WARNING: No word timestamps from HeyGen, subtitles will be skipped")
+            print("  WARNING: No word timestamps available, subtitles will be skipped")
 
         # Step 4: Assemble video
         print("\n[4/4] Assembling final video...")

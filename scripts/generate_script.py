@@ -180,8 +180,8 @@ def parse_script_response(raw_response):
 def main():
     parser = argparse.ArgumentParser(description="Generate a YouTube video script from a trending topic")
     parser.add_argument("--topic", required=True, help="Path to trending topic JSON file")
-    parser.add_argument("--ai", default="openai", choices=["openai", "claude"],
-                        help="AI backend to use (default: openai)")
+    parser.add_argument("--ai", default="claude", choices=["openai", "claude"],
+                        help="AI backend to use (default: claude)")
     parser.add_argument("--ai-model", default=None,
                         help="Override AI model (default: gpt-4o-mini for openai, claude-haiku for claude)")
     parser.add_argument("--output", default=None, help="Output file path")
