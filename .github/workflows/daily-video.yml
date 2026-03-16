@@ -1,0 +1,121 @@
+name: Daily Video Pipeline — Ambitious Rulers
+
+on:
+  # Daily at 10:00 AM Dubai time (UTC+4) = 06:00 UTC
+  schedule:
+    - cron: "0 6 * * *"
+
+  # Manual trigger from GitHub UI
+  workflow_dispatch:
+    inputs:
+      category:
+        description: "Topic category override"
+        required: false
+        default: "geopolitics"
+        type: choice
+        options:
+          - geopolitics
+          - all
+      skip_upload:
+        description: "Skip YouTube upload"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  generate-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ── 1. Checkout repo ──────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python ──────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # ── 3. Install FFmpeg ─────────────────────────────────
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg libass-dev fonts-liberation
+
+      # ── 4. Install Python dependencies ────────────────────
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # ── 5. Set up Montserrat font ────────────────────────
+      - name: Set up Montserrat Bold font
+        run: python scripts/setup_fonts.py
+
+      # ── 6. Create .env from secrets ──────────────────────
+      - name: Create .env file
+        run: |
+          cat > .env << 'ENVEOF'
+          YOUTUBE_API_KEY=${{ secrets.YOUTUBE_API_KEY }}
+          YOUTUBE_CLIENT_ID=${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET=${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN=${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          HEYGEN_API_KEY=${{ secrets.HEYGEN_API_KEY }}
+          PEXELS_API_KEY=${{ secrets.PEXELS_API_KEY }}
+          ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}
+          ENABLED_CATEGORIES=geopolitics
+          SCRIPT_AI=anthropic
+          DEFAULT_VOICE=Brian
+          VIDEO_PRIVACY=public
+          TARGET_DURATION=75
+          YOUTUBE_REGION=US
+          SUBTITLE_FONT_SIZE=28
+          SUBTITLE_TEXT_COLOR=#000000
+          SUBTITLE_BG_OPACITY=0.6
+          SUBTITLE_POSITION=lower_third
+          SUBTITLE_LINE_WIDTH=42
+          LOG_LEVEL=INFO
+          SAVE_RUN_LOGS=true
+          KEEP_TEMP_FILES=false
+          ENVEOF
+
+      # ── 7. Run the pipeline ──────────────────────────────
+      - name: Run daily video pipeline
+        run: |
+          CATEGORY="${{ github.event.inputs.category || 'geopolitics' }}"
+          SKIP_FLAG=""
+          if [ "${{ github.event.inputs.skip_upload }}" = "true" ]; then
+            SKIP_FLAG="--skip-upload"
+          fi
+          python scripts/run_daily.py --category "$CATEGORY" $SKIP_FLAG
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          HEYGEN_API_KEY: ${{ secrets.HEYGEN_API_KEY }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      # ── 8. Save artifacts (video + logs) ─────────────────
+      - name: Upload video artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-video-${{ github.run_number }}
+          path: |
+            output/*.mp4
+            output/*.json
+            logs/*.json
+          retention-days: 7
+
+      # ── 9. Commit topic history to avoid duplicates ──────
+      - name: Commit topic history
+        if: success()
+        run: |
+          git config user.name "Ambitious Rulers Bot"
+          git config user.email "bot@ambitiousrulers.com"
+          git add history/ logs/ || true
+          git diff --cached --quiet || git commit -m "chore: update topic history [skip ci]"
+          git push || true

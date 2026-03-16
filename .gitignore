@@ -1,7 +1,6 @@
 .env
 output/
 logs/
-history/
 assets/fonts/
 __pycache__/
 *.pyc
