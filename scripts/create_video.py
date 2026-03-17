@@ -76,17 +76,22 @@ def fetch_stock_clips(queries, count_per_query=2, min_duration=5):
             if duration < min_duration:
                 continue
 
-            # Get the HD file — prefer MP4 format (most compatible)
+            # Get an HD file — prefer MP4 at 720p-1080p (NOT 4K — too much RAM)
             video_files = video.get("video_files", [])
-            # Prefer mp4 files first, then any format
             mp4_files = [f for f in video_files if f.get("file_type", "") == "video/mp4"]
             candidate_files = mp4_files if mp4_files else video_files
-            hd_files = [f for f in candidate_files if f.get("height", 0) >= 720]
-            if not hd_files:
-                hd_files = candidate_files
 
-            if hd_files:
-                best_file = sorted(hd_files, key=lambda x: x.get("height", 0), reverse=True)[0]
+            # Target 720p-1080p range: enough quality, won't blow RAM on Docker
+            ideal_files = [f for f in candidate_files if 720 <= f.get("height", 0) <= 1080]
+            if not ideal_files:
+                # Fallback: anything under 1440p
+                ideal_files = [f for f in candidate_files if f.get("height", 0) <= 1440]
+            if not ideal_files:
+                ideal_files = candidate_files
+
+            if ideal_files:
+                # Pick closest to 1080p
+                best_file = sorted(ideal_files, key=lambda x: abs(x.get("height", 0) - 1080))[0]
                 clips.append({
                     "url": best_file["link"],
                     "query": query,
@@ -162,9 +167,11 @@ def download_clip(url, output_path):
 
     codec_info = probe.stdout.strip()
 
-    # Step 4: Re-encode to standard format
+    # Step 4: Re-encode to standard 1080p format (memory-safe for Docker)
     cmd = [
-        "ffmpeg", "-y", "-i", raw_path,
+        "ffmpeg", "-y",
+        "-threads", "2",            # Limit threads to save RAM
+        "-i", raw_path,
         "-t", "30",
         "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,fps=30",
         "-c:v", "libx264", "-preset", "fast", "-crf", "23",
