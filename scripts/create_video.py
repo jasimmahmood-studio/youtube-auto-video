@@ -107,61 +107,88 @@ def fetch_stock_clips(queries, count_per_query=2, min_duration=5):
 
 def download_clip(url, output_path):
     """
-    Download a video clip using FFmpeg directly from URL.
-    FFmpeg handles format detection natively — no file extension guessing.
-    This also normalizes the clip to 1920x1080 @ 30fps in one step.
+    Download a video clip from Pexels and normalize to 1920x1080 @ 30fps.
+    Uses requests for download (reliable HTTP) + FFmpeg for re-encode.
     """
-    # Use FFmpeg to download + re-encode in one shot
-    # This handles VP9/WebM/AV1/whatever Pexels serves
+    raw_path = output_path + ".raw"
+
+    # Step 1: Download via requests (more reliable than FFmpeg HTTP on Docker)
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "*/*",
+        }
+        resp = requests.get(url, stream=True, timeout=120, headers=headers)
+        resp.raise_for_status()
+
+        content_type = resp.headers.get("Content-Type", "unknown")
+        with open(raw_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=65536):
+                f.write(chunk)
+
+        file_size = os.path.getsize(raw_path)
+
+        if file_size < 50_000:
+            print(f"  SKIP: too small ({file_size} bytes, type={content_type})")
+            os.remove(raw_path)
+            return None
+
+    except Exception as e:
+        print(f"  DOWNLOAD FAILED: {e}")
+        if os.path.exists(raw_path):
+            os.remove(raw_path)
+        return None
+
+    # Step 2: Check what we actually downloaded
+    with open(raw_path, "rb") as f:
+        magic = f.read(12)
+
+    # Detect if it's HTML (error page) instead of video
+    if magic[:5] in (b'<!DOC', b'<html', b'<HTML', b'<?xml'):
+        print(f"  SKIP: downloaded HTML instead of video (CDN error)")
+        os.remove(raw_path)
+        return None
+
+    # Step 3: Probe the file to check format
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_name,width,height",
+         "-of", "csv=p=0", raw_path],
+        capture_output=True, text=True
+    )
+    if probe.returncode != 0:
+        print(f"  SKIP: ffprobe failed — {probe.stderr[:150]}")
+        os.remove(raw_path)
+        return None
+
+    codec_info = probe.stdout.strip()
+
+    # Step 4: Re-encode to standard format
     cmd = [
-        "ffmpeg", "-y",
-        "-i", url,
-        "-t", "30",  # Cap at 30s per clip to save space
+        "ffmpeg", "-y", "-i", raw_path,
+        "-t", "30",
         "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,fps=30",
         "-c:v", "libx264", "-preset", "fast", "-crf", "23",
         "-pix_fmt", "yuv420p",
         "-an",
         output_path
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+
+    # Clean raw file
+    if os.path.exists(raw_path):
+        os.remove(raw_path)
 
     if result.returncode == 0 and Path(output_path).exists() and Path(output_path).stat().st_size > 10_000:
         return output_path
 
-    # If FFmpeg URL download fails, try requests + FFmpeg pipe
-    try:
-        resp = requests.get(url, stream=True, timeout=60)
-        resp.raise_for_status()
-        raw_path = output_path + ".raw"
-        with open(raw_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8192):
-                f.write(chunk)
-
-        if os.path.getsize(raw_path) < 50_000:
-            os.remove(raw_path)
-            return None
-
-        cmd2 = [
-            "ffmpeg", "-y", "-i", raw_path,
-            "-t", "30",
-            "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,fps=30",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-pix_fmt", "yuv420p",
-            "-an",
-            output_path
-        ]
-        result2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=120)
-        if os.path.exists(raw_path):
-            os.remove(raw_path)
-
-        if result2.returncode == 0 and Path(output_path).exists() and Path(output_path).stat().st_size > 10_000:
-            return output_path
-        else:
-            print(f"  FAILED: {result2.stderr[-200:]}")
-            return None
-    except Exception as e:
-        print(f"  FAILED fallback download: {e}")
-        return None
+    # Show the BEGINNING of stderr (where the actual error is)
+    err_lines = result.stderr.split('\n')
+    error_lines = [l for l in err_lines if 'error' in l.lower() or 'invalid' in l.lower() or 'no such' in l.lower()]
+    if error_lines:
+        print(f"  ENCODE FAILED ({codec_info}): {'; '.join(error_lines[:3])}")
+    else:
+        print(f"  ENCODE FAILED ({codec_info}): {result.stderr[:300]}")
+    return None
 
 
 # ─── Narration (HeyGen TTS) ──────────────────────────────────────────
