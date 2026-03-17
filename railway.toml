@@ -1,0 +1,8 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# Run daily at 10:00 AM Dubai time (UTC+4) = 06:00 UTC
+cronSchedule = "0 6 * * *"
+restartPolicyType = "NEVER"
