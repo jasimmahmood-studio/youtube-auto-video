@@ -28,7 +28,9 @@ def load_prompt_template():
             "system": (
                 "You are a professional YouTube scriptwriter specializing in faceless narration-style videos. "
                 "You write scripts that are engaging, informative, and optimized for audience retention. "
-                "Your tone is conversational but authoritative. You never use filler phrases like 'In this video'."
+                "Your tone is conversational but authoritative. You never use filler phrases like 'In this video'. "
+                "IMPORTANT: You MUST write everything in English only. Never use Hindi, Arabic, or any other language. "
+                "All titles, descriptions, tags, and scripts must be in English."
             ),
             "user_template": (
                 "Write a YouTube video script about: {topic_title}\n\n"
@@ -38,7 +40,8 @@ def load_prompt_template():
                 "Structure: HOOK (5s) → CONTEXT (10s) → BODY with 3-4 points (55s) → CTA (15s)\n\n"
                 "Generate title (under 60 chars, curiosity-driven), description (150 words, SEO-optimized), "
                 "tags (15-20), script_text, sections array, and stock_footage_queries (5-8 Pexels search terms).\n\n"
-                "Return as valid JSON with keys: title, description, tags, script_text, sections, stock_footage_queries"
+                "CRITICAL: Everything MUST be in English. Return ONLY valid JSON (no markdown, no code fences) "
+                "with keys: title, description, tags, script_text, sections, stock_footage_queries"
             )
         }
 
@@ -140,9 +143,24 @@ def parse_script_response(raw_response):
                 text = text.rsplit("```", 1)[0]
         script_data = json.loads(text)
     except json.JSONDecodeError as e:
-        print(f"ERROR: Failed to parse AI response as JSON: {e}")
-        print(f"Raw response: {raw_response[:500]}")
-        sys.exit(1)
+        # Try to repair truncated JSON by closing open strings/arrays/objects
+        print(f"WARNING: JSON parse failed ({e}), attempting repair...")
+        repaired = text.rstrip()
+        # Close any unterminated string
+        if repaired.count('"') % 2 != 0:
+            repaired += '"'
+        # Close any open arrays/objects
+        open_brackets = repaired.count('[') - repaired.count(']')
+        open_braces = repaired.count('{') - repaired.count('}')
+        repaired += ']' * max(0, open_brackets)
+        repaired += '}' * max(0, open_braces)
+        try:
+            script_data = json.loads(repaired)
+            print("  JSON repair succeeded")
+        except json.JSONDecodeError:
+            print(f"ERROR: Failed to parse AI response as JSON even after repair")
+            print(f"Raw response: {raw_response[:500]}")
+            sys.exit(1)
 
     # Validate required fields
     required_fields = ["title", "description", "tags", "script_text", "sections", "stock_footage_queries"]

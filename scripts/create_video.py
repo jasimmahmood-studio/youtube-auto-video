@@ -106,34 +106,62 @@ def fetch_stock_clips(queries, count_per_query=2, min_duration=5):
 
 
 def download_clip(url, output_path):
-    """Download a video clip and validate it's a real video file."""
-    resp = requests.get(url, stream=True, timeout=60)
-    resp.raise_for_status()
+    """
+    Download a video clip using FFmpeg directly from URL.
+    FFmpeg handles format detection natively — no file extension guessing.
+    This also normalizes the clip to 1920x1080 @ 30fps in one step.
+    """
+    # Use FFmpeg to download + re-encode in one shot
+    # This handles VP9/WebM/AV1/whatever Pexels serves
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", url,
+        "-t", "30",  # Cap at 30s per clip to save space
+        "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,fps=30",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-an",
+        output_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
 
-    with open(output_path, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=8192):
-            f.write(chunk)
+    if result.returncode == 0 and Path(output_path).exists() and Path(output_path).stat().st_size > 10_000:
+        return output_path
 
-    # Validate: file must be > 50KB and readable by ffprobe
-    file_size = os.path.getsize(output_path)
-    if file_size < 50_000:
-        print(f"  WARNING: Downloaded file too small ({file_size} bytes), skipping")
-        os.remove(output_path)
+    # If FFmpeg URL download fails, try requests + FFmpeg pipe
+    try:
+        resp = requests.get(url, stream=True, timeout=60)
+        resp.raise_for_status()
+        raw_path = output_path + ".raw"
+        with open(raw_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                f.write(chunk)
+
+        if os.path.getsize(raw_path) < 50_000:
+            os.remove(raw_path)
+            return None
+
+        cmd2 = [
+            "ffmpeg", "-y", "-i", raw_path,
+            "-t", "30",
+            "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,fps=30",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-an",
+            output_path
+        ]
+        result2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=120)
+        if os.path.exists(raw_path):
+            os.remove(raw_path)
+
+        if result2.returncode == 0 and Path(output_path).exists() and Path(output_path).stat().st_size > 10_000:
+            return output_path
+        else:
+            print(f"  FAILED: {result2.stderr[-200:]}")
+            return None
+    except Exception as e:
+        print(f"  FAILED fallback download: {e}")
         return None
-
-    # Verify ffprobe can read it
-    probe = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=codec_name,width,height,duration",
-         "-of", "json", output_path],
-        capture_output=True, text=True
-    )
-    if probe.returncode != 0:
-        print(f"  WARNING: ffprobe can't read file, skipping: {probe.stderr[:100]}")
-        os.remove(output_path)
-        return None
-
-    return output_path
 
 
 # ─── Narration (HeyGen TTS) ──────────────────────────────────────────
@@ -381,145 +409,63 @@ def assemble_video(clips_dir, audio_path, srt_path, output_path, bg_music_path=N
     )
     audio_duration = float(probe.stdout.strip())
 
-    # List all raw clip files
-    raw_clips = sorted(Path(clips_dir).glob("*.mp4"))
-    if not raw_clips:
+    # Clips are already normalized to 1920x1080 @ 30fps during download.
+    # Just list them, measure durations, loop to fill audio length, and concat.
+    clip_files = sorted(Path(clips_dir).glob("*.mp4"))
+    if not clip_files:
         print("ERROR: No clip files found in", clips_dir)
         sys.exit(1)
 
-    # Step 1a: Normalize every clip to identical format (codec, resolution, fps, pixel format)
-    # This is REQUIRED — concat demuxer freezes if clips differ in any of these
-    norm_dir = Path(clips_dir) / "normalized"
-    norm_dir.mkdir(exist_ok=True)
-    norm_clips = []
+    # Get actual duration of each clip
+    clip_durations = {}
+    for clip in clip_files:
+        try:
+            p = subprocess.run(
+                ["ffprobe", "-i", str(clip), "-show_entries", "format=duration",
+                 "-v", "quiet", "-of", "csv=p=0"],
+                capture_output=True, text=True
+            )
+            clip_durations[clip] = float(p.stdout.strip())
+        except (ValueError, Exception):
+            clip_durations[clip] = 10.0
 
-    print(f"  Normalizing {len(raw_clips)} clips to 1920x1080 @ 30fps...")
-    for i, clip in enumerate(raw_clips):
-        # Skip files that are too small (failed downloads)
-        if clip.stat().st_size < 50_000:
-            print(f"  SKIP {clip.name}: file too small ({clip.stat().st_size} bytes)")
-            continue
+    total_clip_pool = sum(clip_durations.values())
+    print(f"  Clips: {len(clip_files)} files, {total_clip_pool:.1f}s total")
+    print(f"  Audio: {audio_duration:.1f}s")
 
-        norm_path = norm_dir / f"norm_{i:03d}.mp4"
+    # Build concat list, looping clips until we cover audio + 20% buffer
+    concat_file = Path(clips_dir) / "concat.txt"
+    total_clip_duration = 0
+    target_duration = audio_duration * 1.2
 
-        # Try standard normalization first
-        cmd_norm = [
-            "ffmpeg", "-y", "-i", str(clip),
-            "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,fps=30",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-pix_fmt", "yuv420p",
-            "-an",
-            str(norm_path)
-        ]
-        result = subprocess.run(cmd_norm, capture_output=True, text=True)
-
-        if result.returncode == 0 and norm_path.exists() and norm_path.stat().st_size > 10_000:
-            norm_clips.append(norm_path)
-            continue
-
-        # Fallback: simpler re-encode (no filter chain, just resize)
-        cmd_simple = [
-            "ffmpeg", "-y", "-i", str(clip),
-            "-s", "1920x1080", "-r", "30",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-pix_fmt", "yuv420p",
-            "-an",
-            str(norm_path)
-        ]
-        result2 = subprocess.run(cmd_simple, capture_output=True, text=True)
-
-        if result2.returncode == 0 and norm_path.exists() and norm_path.stat().st_size > 10_000:
-            norm_clips.append(norm_path)
-            print(f"  {clip.name}: normalized with fallback method")
-        else:
-            # Print enough of the error to actually debug
-            err = result.stderr + "\n---FALLBACK---\n" + result2.stderr
-            print(f"  FAILED {clip.name} ({clip.stat().st_size} bytes):")
-            print(f"    {err[-500:]}")
-
-    if not norm_clips:
-        print("ERROR: All clip normalizations failed. Trying direct concat as last resort...")
-        # Last resort: skip normalization entirely, use raw clips with re-encode in concat step
-        concat_file = Path(clips_dir) / "concat.txt"
-        with open(concat_file, "w") as f:
-            for clip in raw_clips:
-                if clip.stat().st_size > 50_000:
-                    f.write(f"file '{clip.resolve()}'\n")
-
-        concat_video = Path(clips_dir) / "concat.mp4"
-        cmd_concat = [
-            "ffmpeg", "-y",
-            "-f", "concat", "-safe", "0", "-i", str(concat_file),
-            "-t", str(audio_duration),
-            "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,fps=30",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-pix_fmt", "yuv420p",
-            "-an",
-            str(concat_video)
-        ]
-        result = subprocess.run(cmd_concat, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"ERROR: Even direct concat failed:\n{result.stderr[-500:]}")
-            sys.exit(1)
-        print(f"  Direct concat succeeded (fallback)")
-        # Skip the rest of the normalization/concat steps below
-        norm_clips = None  # Signal to skip steps 1b/1c
-
-    # Steps 1b/1c: Only run if normalization succeeded (not fallback path)
-    concat_video = Path(clips_dir) / "concat.mp4"
-
-    if norm_clips is not None:
-        # Get actual duration of each normalized clip
-        clip_durations = {}
-        for clip in norm_clips:
-            try:
-                p = subprocess.run(
-                    ["ffprobe", "-i", str(clip), "-show_entries", "format=duration",
-                     "-v", "quiet", "-of", "csv=p=0"],
-                    capture_output=True, text=True
-                )
-                clip_durations[clip] = float(p.stdout.strip())
-            except (ValueError, Exception):
-                clip_durations[clip] = 5.0
-
-        total_clip_pool = sum(clip_durations.values())
-        print(f"  Stock footage pool: {total_clip_pool:.1f}s across {len(norm_clips)} clips")
-        print(f"  Audio duration: {audio_duration:.1f}s")
-
-        # Step 1b: Build concat list, looping normalized clips until we cover audio + 20% buffer
-        concat_file = Path(clips_dir) / "concat.txt"
-        total_clip_duration = 0
-        target_duration = audio_duration * 1.2
-
-        with open(concat_file, "w") as f:
-            loop_count = 0
-            while total_clip_duration < target_duration:
-                for clip in norm_clips:
-                    if total_clip_duration >= target_duration:
-                        break
-                    f.write(f"file '{clip.resolve()}'\n")
-                    total_clip_duration += clip_durations.get(clip, 5.0)
-                loop_count += 1
-                if loop_count > 20:
+    with open(concat_file, "w") as f:
+        loop_count = 0
+        while total_clip_duration < target_duration:
+            for clip in clip_files:
+                if total_clip_duration >= target_duration:
                     break
+                f.write(f"file '{clip.resolve()}'\n")
+                total_clip_duration += clip_durations.get(clip, 10.0)
+            loop_count += 1
+            if loop_count > 20:
+                break
 
-        print(f"  Concat plan: {total_clip_duration:.1f}s of footage ({loop_count} loop(s))")
+    print(f"  Concat plan: {total_clip_duration:.1f}s ({loop_count} loop(s))")
 
-        # Step 1c: Concatenate normalized clips (now safe — all identical format)
-        cmd_concat = [
-            "ffmpeg", "-y",
-            "-f", "concat", "-safe", "0", "-i", str(concat_file),
-            "-t", str(audio_duration),
-            "-c:v", "copy",
-            "-an",
-            str(concat_video)
-        ]
-        result = subprocess.run(cmd_concat, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"ERROR: Concat failed:\n{result.stderr[-500:]}")
-            sys.exit(1)
-    else:
-        print("  Using fallback concat (already built above)")
+    # Concatenate — all clips are already identical format, so use -c:v copy (fast)
+    concat_video = Path(clips_dir) / "concat.mp4"
+    cmd_concat = [
+        "ffmpeg", "-y",
+        "-f", "concat", "-safe", "0", "-i", str(concat_file),
+        "-t", str(audio_duration),
+        "-c:v", "copy",
+        "-an",
+        str(concat_video)
+    ]
+    result = subprocess.run(cmd_concat, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"ERROR: Concat failed:\n{result.stderr[-500:]}")
+        sys.exit(1)
 
     # Step 2: Merge video + audio + subtitles
     # Build the subtitle filter string (yellow border + black shadow = 3D look)
